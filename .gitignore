@@ -9,13 +9,17 @@
 
 # --- Rust Build Artifacts ---
 /target/
-Cargo.lock          # Uncomment if this is a library; keep for binaries (default: tracked)
+
+# --- SQLite Databases (live mode output) ---
+*.db
+*.db-shm
+*.db-wal
 
 # --- Logs ---
 *.log
 logs/
 
-# --- Output / Results ---
+# --- Output / Results (replay mode) ---
 alpha_wallets.json
 *.json
 !*example*.json
