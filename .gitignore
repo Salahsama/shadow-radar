@@ -1,0 +1,35 @@
+# =============================================================================
+# Shadow-Radar — .gitignore
+# =============================================================================
+
+# --- Secrets & Environment ---
+.env
+*.env.*
+!.env.example
+
+# --- Rust Build Artifacts ---
+/target/
+Cargo.lock          # Uncomment if this is a library; keep for binaries (default: tracked)
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Output / Results ---
+alpha_wallets.json
+*.json
+!*example*.json
+!*template*.json
+
+# --- IDE & Editor ---
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,60 @@
+[package]
+name = "shadow-radar"
+version = "0.1.0"
+edition = "2021"
+description = "Advanced Solana Wallet Profiler — mines historical DEX swap data to rank Smart Money wallets for safe copy-trading"
+
+[[bin]]
+name = "shadow-radar"
+path = "src/main.rs"
+
+[dependencies]
+# Solana core
+solana-sdk = "2.1.14"
+solana-client = "2.1.14"
+solana-transaction-status = "2.1.14"
+
+# Yellowstone gRPC
+yellowstone-grpc-client = "4.1.0"
+yellowstone-grpc-proto = "4.1.1"
+
+# Async runtime
+tokio = { version = "1.21.2", features = ["full"] }
+tokio-stream = "0.1.11"
+futures-util = "0.3.30"
+
+# Serialization
+serde = { version = "1.0.145", features = ["derive"] }
+serde_json = "1.0.86"
+
+# CLI & Config
+clap = { version = "4.5.7", features = ["derive"] }
+dotenv = "0.15"
+
+# Error handling
+anyhow = "1.0.62"
+thiserror = "1.0"
+
+# Encoding
+bs58 = "0.4"
+base64 = "0.13"
+
+# Concurrency
+dashmap = "5.5.3"
+
+# Logging & Output
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+colored = "3.0.0"
+indicatif = "0.17.8"
+
+# Time
+chrono = "0.4.26"
+
+# Misc
+maplit = "1.0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
