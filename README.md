@@ -1,6 +1,6 @@
 # Shadow-Radar 🎯
 
-> **Advanced Solana Smart Money Profiler** — mines historical DEX swap data via Yellowstone gRPC replay, profiles wallets through a 4-stage quantitative filter pipeline, and ranks the safest copy-trading targets.
+> **Stealth Insider Discovery & Copy Agent** — a real-time Solana daemon that streams live DEX trades via Yellowstone gRPC, profiles wallets through 4 strict heuristic filters, and persists high-signal targets into a SQLite database for downstream copy-trading execution.
 
 **Read-only analytics · No private keys · No transactions**
 
@@ -8,100 +8,111 @@
 
 ## Overview
 
-Shadow-Radar is a high-performance Rust CLI tool built to answer one question:
+Shadow-Radar operates in two modes:
+
+- **`live` mode** — Runs as a continuous daemon, streaming real-time trades and building rolling 24h wallet profiles. Qualified wallets are written to `targets.db` (SQLite) for your execution bot to poll.
+- **`replay` mode** — One-shot historical batch scan over 12–24h of data. Outputs a ranked JSON report.
 
 > *Which wallets on Solana are genuinely alpha — not snipers, not MEV bots, not herd-followers?*
 
-It replays 12–24 hours of live DEX swap data from a Yellowstone gRPC stream, builds per-wallet trade profiles, and runs them through four mathematically rigorous filters. The surviving wallets are ranked by a composite Expectancy Score and written to a JSON report ready to feed into your copy-trading workflow.
-
-**Supported DEXes:** PumpFun · PumpSwap · Raydium
+**Supported DEXes:** PumpFun · PumpSwap · Raydium Launchpad · **Raydium AMM V4**
 
 ---
 
 ## Architecture
 
-The pipeline runs in 5 sequential phases:
+### Live Mode (Daemon)
+
+Three concurrent async tasks run indefinitely:
 
 ```
-Yellowstone gRPC Replay
+Yellowstone gRPC (4 DEX programs)
         │
         ▼
- [Phase 1] grpc_streamer   — Streams raw transactions from historical slots
+  [Task 1] gRPC Streamer ──→ mpsc channel (100k buffer)
         │
         ▼
- [Phase 2] transaction_parser + aggregator
-                           — Parses DEX swap instructions, aggregates into wallet profiles
+  [Task 2] Trade Processor
+        ├─ InsiderCache (moka, 24h TTL)
+        │     ├─ TokenRegistry   — T₀ slot tracking
+        │     ├─ WalletState     — Last-20 sliding window
+        │     └─ BuyIndex        — Anti-herd correlation
         │
-        ▼
- [Phase 3] filters         — Applies 4-stage filter pipeline (A → B → C → D)
+        ├─ Heuristic Evaluator (4 strict filters)
         │
-        ▼
- [Phase 4] ranker          — Computes composite score, selects top N wallets
-        │
-        ▼
- [Phase 5] output          — Prints terminal report + writes alpha_wallets.json
+        └──→ targets.db (SQLite WAL) ←── Execution bot polls
+        
+  [Task 3] Maintenance (every 5 min)
+        ├─ Cache eviction
+        ├─ Trade pruning
+        └─ Stale wallet demotion
+```
+
+### Replay Mode (Batch)
+
+```
+Yellowstone gRPC Replay → Parser → Aggregator → Filters → Ranker → alpha_wallets.json
 ```
 
 ### Source Modules
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | CLI entry point, pipeline orchestration |
-| `config.rs` | CLI args (`clap`) + `.env` loading, all filter thresholds |
-| `models.rs` | Core data types: `ParsedTrade`, `WalletProfile`, `TradeCycle` |
-| `grpc_streamer.rs` | Yellowstone gRPC connection, slot replay, raw tx streaming |
-| `transaction_parser.rs` | DEX discriminator-based instruction parser (PumpFun/PumpSwap/Raydium) |
-| `aggregator.rs` | Builds wallet profiles from the trade stream via async mpsc channel |
-| `filters.rs` | 4-stage quantitative filter pipeline |
-| `ranker.rs` | Composite score calculation and top-N selection |
-| `output.rs` | Terminal report (colored) + JSON file writer |
+| `main.rs` | Mode dispatch (`live` / `replay`), daemon orchestration |
+| `config.rs` | CLI args (`clap`) + `.env` loading, filter thresholds |
+| `models.rs` | Core data types: `ParsedTrade`, `WalletProfile`, `DexType` |
+| `grpc_streamer.rs` | Yellowstone gRPC connection (historical replay + live stream) |
+| `transaction_parser.rs` | Discriminator-based parser (PumpFun/PumpSwap/Raydium) + balance-diff parser (Raydium V4) |
+| `wallet_state.rs` | Per-wallet sliding window: `AnnotatedTrade`, `TokenPosition`, `CompletedCycle` |
+| `token_registry.rs` | T₀ tracking with lower-slot revision resilience |
+| `cache.rs` | Central moka cache orchestrator — trade ingestion, T₀ annotation, anti-herd indexing |
+| `heuristics.rs` | 4 strict heuristic filters (win rate, anti-sniper, anti-whale/herd, sizing) |
+| `db.rs` | SQLite persistence (WAL mode) — qualified wallets, trade log, discovery log |
+| `aggregator.rs` | Batch wallet profile builder (replay mode) |
+| `filters.rs` | Batch filter pipeline (replay mode) |
+| `ranker.rs` | Composite score calculation and top-N selection (replay mode) |
+| `output.rs` | Terminal report + JSON writer (replay mode) |
 
 ---
 
-## Filter Pipeline
+## Heuristic Filters (Live Mode)
 
-Wallets are disqualified in order. Only wallets that survive all four filters are ranked.
+Wallets must pass **all four filters** to be written to `targets.db`. All filters operate on a rolling 24-hour sliding window.
 
-### Filter A — Capital Proportionality
-Removes wallets whose average trade size is outside the band `[0.1, 2.0] SOL`.
-- Dust traders (`< 0.1 SOL`) are noise.
-- Whales (`> 2.0 SOL`) move markets and can't be safely followed at retail scale.
+### Filter 1 — Win Rate (≥ 80%)
+The wallet must have an 80%+ win rate over its last 20 completed buy→sell cycles. A win = realized PnL > 0 after fees.
 
-### Filter B — Anti-Herd / MEV Trap Detection
-For each buy by wallet W on token T at slot S, counts the number of **copycat buys** from other wallets within the same slot (later tx index) or the next slot (≤ 800ms window).
+### Filter 2 — Anti-Sniper (T₀ + Δt Window)
+Measures the slot delta between a wallet's buy and the token's first liquidity event (T₀):
 
-If `≥ 3 copycats` follow `≥ 50%` of a wallet's buys → **disqualified as an MEV attractor or pump orchestrator**.
-
-This is the most critical filter — it separates genuine alpha from wallets that are simply being front-run or followed by bots.
-
-### Filter C — Latency / Entry Delta
-Detects two patterns based on the time delta between pool creation and first entry:
-
-| Pattern | Criteria | Action |
+| Slot Delta | Classification | Effect |
 |---|---|---|
-| **Sniper** | Buys within ≤ 2 slots of pool creation in ≥ 50% of trades | ❌ Disqualified |
-| **Momentum Trader** | Buys 5–15 minutes after pool creation in ≥ 60% of trades | ✅ Flagged (preferred) |
+| `< 3` | Sniper | ❌ Penalized |
+| `[3, 15]` | **Insider window** | ✅ Required |
+| `> 15` | Retail momentum | ❌ Penalized |
 
-Snipers rely on block-0 execution advantages that are non-replicable and introduce extreme risk.
+**≥ 50% of a wallet's entries must fall in the [3, 15] insider window.**
 
-### Filter D — Expectancy Formula
-Enforces minimum statistical edge:
+T₀ is resilient — if the daemon later observes a transaction at a lower slot, T₀ is revised downward and all affected wallets are re-annotated.
 
-```
-Expectancy Score = Win_Rate × (Avg_Gain% / Avg_Loss%)
-```
+### Filter 3 — Anti-Whale & Anti-Herd
+- **Anti-Whale:** Average entry size must be ≤ 5 SOL.
+- **Anti-Herd:** For each buy, counts distinct wallets that buy the same token within 3 slots. If ≥ 4 copycats follow ≥ 50% of a wallet's buys → disqualified as an MEV attractor.
 
-**Minimum requirements to pass:**
-- Win Rate ≥ **60%**
-- Average Gain on winning trades ≥ **100%**
+### Filter 4 — Sizing Profile (Sell Tranches)
+Smart money scales out, not dumps. Each closed position must show:
+- **≥ 2 sell tranches** (not a single 100% dump)
+- **No single sell > 70%** of the total position
+
+≥ 60% of completed positions must meet both criteria.
 
 ---
 
 ## Prerequisites
 
 - **Rust** ≥ 1.75 (2021 edition) — [install via rustup](https://rustup.rs/)
-- A **Yellowstone gRPC** endpoint with historical slot replay support (e.g. [Shyft](https://shyft.to))
-- A standard **Solana RPC** endpoint for slot-time lookups (e.g. Helius, Shyft)
+- A **Yellowstone gRPC** endpoint with `x-token` auth (e.g. [Nexus/Kaldera](https://www.constant-k.com/), [Shyft](https://shyft.to))
+- A standard **Solana RPC** endpoint (e.g. Helius, Shyft)
 
 ---
 
@@ -120,9 +131,9 @@ cp .env.example .env
 
 Edit `.env` with your credentials:
 ```env
-YELLOWSTONE_GRPC_HTTP=https://grpc.ny.shyft.to
-YELLOWSTONE_GRPC_TOKEN=YOUR_GRPC_TOKEN
-RPC_HTTP=https://rpc.shyft.to?api_key=YOUR_API_KEY
+YELLOWSTONE_GRPC_HTTP=https://your-grpc-endpoint.com
+YELLOWSTONE_GRPC_TOKEN=YOUR_GRPC_X_TOKEN
+RPC_HTTP=https://your-rpc-endpoint.com
 ```
 
 **3. Build (release mode):**
@@ -130,24 +141,30 @@ RPC_HTTP=https://rpc.shyft.to?api_key=YOUR_API_KEY
 cargo build --release
 ```
 
-The binary will be at `./target/release/shadow-radar`.
-
 ---
 
 ## Usage
 
-### Quick start (24-hour scan, top 5 wallets)
+### Live mode (recommended — run on VPS)
+
+Start the daemon. It runs indefinitely, streaming trades and qualifying wallets:
 ```bash
-./target/release/shadow-radar
+# Foreground (with verbose logging)
+./target/release/shadow-radar --mode live --db targets.db -v
+
+# Background (production VPS deployment)
+nohup ./target/release/shadow-radar --mode live --db targets.db > shadow-radar.log 2>&1 &
 ```
 
-### Custom scan window
-```bash
-# 12-hour scan
-./target/release/shadow-radar --hours 12
+Stops cleanly on `Ctrl+C` or `kill <pid>`.
 
-# Stricter quality bar: 10 completed cycles, top 3 wallets
-./target/release/shadow-radar --hours 24 --min-cycles 10 --top 3
+### Replay mode (one-shot batch scan)
+```bash
+# 24-hour scan, top 5 wallets
+./target/release/shadow-radar --mode replay
+
+# 12-hour scan, stricter quality bar
+./target/release/shadow-radar --mode replay --hours 12 --min-cycles 10 --top 3
 ```
 
 ### Full CLI reference
@@ -155,11 +172,13 @@ The binary will be at `./target/release/shadow-radar`.
 Usage: shadow-radar [OPTIONS]
 
 Options:
-  --hours <HOURS>          Replay window in hours [default: 24]
+  --mode <MODE>            Operating mode: 'live' or 'replay' [default: replay]
+  --hours <HOURS>          Replay window in hours (replay mode) [default: 24]
+  --db <PATH>              SQLite database path (live mode) [default: targets.db]
   --min-cycles <N>         Minimum completed trade cycles required [default: 5]
-  --min-trades <N>         Minimum total trades (buys + sells) required [default: 10]
+  --min-trades <N>         Minimum total trades required [default: 10]
   --top <N>                Number of top wallets to output [default: 5]
-  --output <PATH>          Output JSON file path [default: alpha_wallets.json]
+  --output <PATH>          Output JSON file path (replay mode) [default: alpha_wallets.json]
   -v, --verbose            Enable debug-level logging
   -h, --help               Print help
   -V, --version            Print version
@@ -169,10 +188,29 @@ Options:
 
 ## Output
 
-### Terminal report
-A color-coded table is printed to stdout on completion, showing each wallet's key metrics.
+### Live mode → `targets.db` (SQLite)
 
-### JSON report (`alpha_wallets.json`)
+The execution bot polls this database for active targets:
+
+```sql
+SELECT address, win_rate, avg_entry_sol, composite_score
+FROM qualified_wallets
+WHERE is_active = 1
+ORDER BY composite_score DESC;
+```
+
+**Schema:**
+
+| Table | Purpose |
+|---|---|
+| `qualified_wallets` | Currently qualified wallets with metrics + `is_active` flag |
+| `wallet_trades` | Recent trade history for audit/debugging |
+| `discovery_log` | Timestamped log of qualification/demotion events |
+
+The database uses `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL` for lock-free concurrent reads by the execution bot.
+
+### Replay mode → `alpha_wallets.json`
+
 ```json
 {
   "generated_at": "2026-04-15T11:00:16Z",
@@ -183,16 +221,8 @@ A color-coded table is printed to stdout on completion, showing each wallet's ke
   "top_wallets": [
     {
       "rank": 1,
-      "address": "Gygj9QQby4j2jryqyqBHvLP7ctv2SaANgh4sCb69BUpA",
+      "address": "Gygj...",
       "win_rate": 0.643,
-      "avg_trade_size_sol": 0.1998,
-      "expectancy_score": 4.03,
-      "total_trades": 54,
-      "completed_cycles": 14,
-      "avg_gain_pct": 209.01,
-      "avg_loss_pct": 33.38,
-      "momentum_score": 1.0,
-      "mev_safety_score": 0.769,
       "composite_score": 3.91,
       "dominant_dex": "PumpSwap"
     }
@@ -200,15 +230,41 @@ A color-coded table is printed to stdout on completion, showing each wallet's ke
 }
 ```
 
-### Score fields explained
+---
 
-| Field | Description |
+## Deployment Guide (VPS)
+
+### Recommended timing
+
+| Runtime | Signal quality |
 |---|---|
-| `expectancy_score` | `win_rate × (avg_gain / avg_loss)` — core edge metric |
-| `momentum_score` | Fraction of buys in the 5–15 min momentum window (higher = better) |
-| `mev_safety_score` | `1 - mev_herd_ratio` — how often the wallet trades without attracting copycats |
-| `composite_score` | Weighted combination used for final ranking |
-| `dominant_dex` | DEX responsible for the most trades by this wallet |
+| < 2 hours | Too early — wallets haven't completed enough cycles |
+| 4–6 hours | First qualified wallets start appearing |
+| **12–24 hours** | **Solid signal** — most active traders complete 20+ cycles |
+| **48–72 hours** | **Best results** — patterns across Asia/US market sessions |
+| **Continuous (24/7)** | **Ideal** — self-maintaining 24h rolling window |
+
+### Resource requirements
+
+| Resource | Requirement |
+|---|---|
+| CPU | 1–2 cores |
+| RAM | 200–500 MB steady state |
+| Disk | < 50 MB (SQLite DB) |
+| Network | Stable connection to gRPC endpoint |
+
+### Monitoring
+
+```bash
+# Check if daemon is running
+pgrep -a shadow-radar
+
+# Check latest log output
+tail -20 shadow-radar.log
+
+# Check active qualified wallets
+sqlite3 targets.db "SELECT COUNT(*) FROM qualified_wallets WHERE is_active = 1;"
+```
 
 ---
 
@@ -217,6 +273,7 @@ A color-coded table is printed to stdout on completion, showing each wallet's ke
 - **No signing, no execution.** This tool never constructs or submits a Solana transaction.
 - **No private keys.** Only a gRPC auth token and an RPC URL are required.
 - The `.env` file is listed in `.gitignore` and must never be committed.
+- `targets.db` contains only public on-chain data (wallet addresses and trade metrics).
 
 ---
 
