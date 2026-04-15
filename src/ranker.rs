@@ -117,6 +117,7 @@ fn find_dominant_dex(profile: &WalletProfile) -> &str {
             DexType::PumpFun => "PumpFun",
             DexType::PumpSwap => "PumpSwap",
             DexType::RaydiumLaunchpad => "RaydiumLaunchpad",
+            DexType::RaydiumAmmV4 => "RaydiumAmmV4",
             DexType::Unknown => "Unknown",
         })
         .unwrap_or("Unknown")

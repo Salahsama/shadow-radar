@@ -110,6 +110,7 @@ pub async fn stream_historical_trades(
         transaction_parser::PUMP_FUN_PROGRAM.to_string(),
         transaction_parser::PUMP_SWAP_PROGRAM.to_string(),
         transaction_parser::RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
+        transaction_parser::RAYDIUM_AMM_V4_PROGRAM.to_string(),
     ];
 
     let subscription_request = SubscribeRequest {
@@ -277,4 +278,181 @@ pub struct StreamStats {
     pub transactions_seen: u64,
     pub trades_parsed: u64,
     pub slots_processed: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Live mode: continuous gRPC stream for real-time insider discovery
+// ---------------------------------------------------------------------------
+
+/// Stream live DEX transactions indefinitely and push parsed trades into `tx`.
+///
+/// This function runs forever (or until the sender channel is closed / shutdown
+/// signal is received). It handles:
+///   - gRPC auto-reconnection on stream failures
+///   - Heartbeat pings every 30s
+///   - Transaction parsing with Raydium V4 balance-diff support
+///
+/// For use in `--mode live` daemon mode.
+pub async fn stream_live_trades(
+    config: Arc<ShadowConfig>,
+    tx: mpsc::Sender<ParsedTrade>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    info!("{}", "🔴 LIVE MODE: Starting continuous gRPC stream".red().bold());
+
+    loop {
+        // Check shutdown signal
+        if *shutdown.borrow() {
+            info!("🛑 Shutdown signal received, stopping live stream");
+            break;
+        }
+
+        match run_live_stream_session(&config, &tx, &shutdown).await {
+            Ok(()) => {
+                info!("🛑 Live stream session ended cleanly");
+                break;
+            }
+            Err(e) => {
+                error!(
+                    "❌ Live stream session failed: {}. Reconnecting in {}s...",
+                    e, RETRY_DELAY_SECS
+                );
+                time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Single live stream session. Returns Err on connection/stream failure
+/// (caller handles reconnection).
+async fn run_live_stream_session(
+    config: &ShadowConfig,
+    tx: &mpsc::Sender<ParsedTrade>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    // --- Connect ---
+    let mut client = GeyserGrpcClient::build_from_shared(config.yellowstone_grpc_http.clone())
+        .context("Failed to build gRPC client")?
+        .x_token::<String>(Some(config.yellowstone_grpc_token.clone()))
+        .context("Failed to set x_token")?
+        .tls_config(ClientTlsConfig::new().with_native_roots())
+        .context("Failed to set TLS config")?
+        .connect()
+        .await
+        .context("Failed to connect to gRPC endpoint")?;
+
+    info!("🛰️  Connected to Yellowstone gRPC (live mode)");
+
+    // --- Subscribe ---
+    let (subscribe_tx_grpc, mut stream) = client
+        .subscribe()
+        .await
+        .context("Failed to create gRPC subscription")?;
+    let subscribe_tx_grpc = Arc::new(tokio::sync::Mutex::new(subscribe_tx_grpc));
+
+    // Build subscription filter (same programs as historical, but no time bounds)
+    let dex_programs = vec![
+        transaction_parser::PUMP_FUN_PROGRAM.to_string(),
+        transaction_parser::PUMP_SWAP_PROGRAM.to_string(),
+        transaction_parser::RAYDIUM_LAUNCHPAD_PROGRAM.to_string(),
+        transaction_parser::RAYDIUM_AMM_V4_PROGRAM.to_string(),
+    ];
+
+    let subscription_request = SubscribeRequest {
+        transactions: maplit::hashmap! {
+            "dex_swaps_live".to_owned() => SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                signature: None,
+                account_include: dex_programs,
+                account_exclude: vec![],
+                account_required: vec![],
+            }
+        },
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        ..Default::default()
+    };
+
+    subscribe_tx_grpc
+        .lock()
+        .await
+        .send(subscription_request)
+        .await
+        .context("Failed to send live subscribe request")?;
+
+    info!("📡 Subscribed to live DEX transaction stream (4 programs)");
+
+    // --- Heartbeat pings ---
+    let ping_handle = {
+        let subscribe_tx_ping = subscribe_tx_grpc.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+                let ping_request = SubscribeRequest {
+                    ping: Some(SubscribeRequestPing { id: 1 }),
+                    ..Default::default()
+                };
+                if subscribe_tx_ping
+                    .lock()
+                    .await
+                    .send(ping_request)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
+    // --- Main receive loop ---
+    let mut trades_in_session: u64 = 0;
+    let mut last_log_time = std::time::Instant::now();
+
+    while let Some(msg) = stream.next().await {
+        // Check shutdown
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let msg = msg.context("gRPC stream message error")?;
+        let update = match msg.update_oneof {
+            Some(u) => u,
+            None => continue,
+        };
+
+        match update {
+            UpdateOneof::Transaction(txn_update) => {
+                let parsed_trades = transaction_parser::parse_all_events(&txn_update);
+
+                for trade in parsed_trades {
+                    if tx.send(trade).await.is_err() {
+                        debug!("Trade channel closed — stopping live stream");
+                        ping_handle.abort();
+                        return Ok(());
+                    }
+                    trades_in_session += 1;
+                }
+
+                // Periodic stats log (every 30 seconds)
+                if last_log_time.elapsed() >= Duration::from_secs(30) {
+                    info!(
+                        "📊 Live stream: {} trades parsed this session",
+                        trades_in_session
+                    );
+                    last_log_time = std::time::Instant::now();
+                }
+            }
+            UpdateOneof::Ping(_) => {
+                debug!("💓 gRPC heartbeat pong received");
+            }
+            _ => {}
+        }
+    }
+
+    ping_handle.abort();
+    Ok(())
 }

@@ -19,9 +19,17 @@ use std::env;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "shadow-radar", version, about, long_about = None)]
 pub struct CliArgs {
-    /// Replay window in hours (12 or 24)
+    /// Operating mode: 'live' for continuous daemon, 'replay' for historical batch
+    #[arg(long, default_value = "replay")]
+    pub mode: String,
+
+    /// Replay window in hours (12 or 24) — only used in replay mode
     #[arg(long, default_value_t = 24)]
     pub hours: u64,
+
+    /// Path to SQLite target database — only used in live mode
+    #[arg(long, default_value = "targets.db")]
+    pub db: String,
 
     /// Minimum number of completed trade cycles to consider a wallet
     #[arg(long, default_value_t = 5)]
@@ -35,7 +43,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 5)]
     pub top: usize,
 
-    /// Output file path
+    /// Output file path (for replay mode)
     #[arg(long, default_value = "alpha_wallets.json")]
     pub output: String,
 

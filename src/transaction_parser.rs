@@ -20,6 +20,11 @@ pub const PUMP_FUN_PROGRAM: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 pub const PUMP_SWAP_PROGRAM: &str = "PSwapMdSai8tjrEXcxFeQth87xC4rRsa4VA5mhGhXkP";
 /// Raydium Launchpad program
 pub const RAYDIUM_LAUNCHPAD_PROGRAM: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+/// Raydium AMM V4 program
+pub const RAYDIUM_AMM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+
+/// Wrapped SOL mint (used to identify SOL legs in token balance parsing)
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 // ---------------------------------------------------------------------------
 // Sub-discriminators (bytes 8..16 of the event buffer)
@@ -801,6 +806,9 @@ fn current_unix_timestamp() -> u64 {
 ///
 /// Walks the inner-instructions looking for recognizable event buffers and
 /// returns all successfully parsed trades.
+///
+/// For Raydium AMM V4 transactions, uses the balance-diff method instead
+/// of inner-instruction buffer parsing (per quant strategist directive).
 pub fn parse_all_events(txn: &SubscribeUpdateTransaction) -> Vec<ParsedTrade> {
     let mut trades = Vec::new();
 
@@ -837,6 +845,21 @@ pub fn parse_all_events(txn: &SubscribeUpdateTransaction) -> Vec<ParsedTrade> {
         );
     }
 
+    // --- Check if this is a Raydium AMM V4 transaction ---
+    // If any account in the transaction is the Raydium V4 program,
+    // use the balance-diff parser instead of inner-instruction parsing.
+    let is_raydium_v4 = is_program_involved(txn, RAYDIUM_AMM_V4_PROGRAM);
+    if is_raydium_v4 {
+        if let Some(mut trade) = parse_raydium_v4_balance_diff(txn) {
+            trade.slot = slot;
+            trade.signature = signature.clone();
+            trade.tx_index = 0;
+            trades.push(trade);
+        }
+        // Still check inner instructions for any embedded PumpSwap events
+        // in case of multi-hop swaps (Raydium → PumpSwap in one tx)
+    }
+
     // Walk inner instructions looking for recognizable event buffers
     for (ix_idx, inner_ixs) in meta.inner_instructions.iter().enumerate() {
         for inner_ix in &inner_ixs.instructions {
@@ -856,4 +879,182 @@ pub fn parse_all_events(txn: &SubscribeUpdateTransaction) -> Vec<ParsedTrade> {
     }
 
     trades
+}
+
+// ---------------------------------------------------------------------------
+// Raydium AMM V4 — Balance-Diff Parser
+// ---------------------------------------------------------------------------
+//
+// Per quant strategist directive: "Do not attempt to parse the raw instruction
+// buffer for Raydium swaps; instead, calculate sol_amount and token received
+// by parsing preTokenBalances and postTokenBalances in the transaction
+// metadata. This is computationally cheaper and IDL-agnostic."
+//
+// Algorithm:
+//   1. Find the signer (fee payer) from account_keys[0]
+//   2. Find the signer's account index in the transaction
+//   3. For each mint in postTokenBalances that belongs to the signer:
+//      - Compute delta = post_amount - pre_amount
+//      - Identify WSOL leg (SOL side) and non-WSOL leg (token side)
+//   4. If WSOL delta < 0 and token delta > 0 → BUY
+//      If WSOL delta > 0 and token delta < 0 → SELL
+
+/// Parse a Raydium AMM V4 swap using preTokenBalances / postTokenBalances diffs.
+fn parse_raydium_v4_balance_diff(txn: &SubscribeUpdateTransaction) -> Option<ParsedTrade> {
+    let wallet = extract_signer(txn)?;
+    let tx_inner = txn.transaction.as_ref()?;
+    let meta = tx_inner.meta.as_ref()?;
+    let message = tx_inner.transaction.as_ref()?.message.as_ref()?;
+
+    // Find the signer's account index (usually 0, but let's be precise)
+    let signer_key = &message.account_keys.first()?;
+    let signer_b58 = bs58::encode(signer_key).into_string();
+
+    // Build a map of account_index → owner for token balances
+    // We need to find which token balance entries belong to the signer
+    // Token balances reference accounts by index, and the owner field tells us
+    // who controls that token account.
+
+    // Compute balance deltas per mint for the signer
+    let mut sol_delta: f64 = 0.0;
+    let mut token_delta: f64 = 0.0;
+    let mut token_mint = String::new();
+    let mut found_sol = false;
+    let mut found_token = false;
+
+    // Walk post_token_balances and match against pre_token_balances
+    for post_bal in &meta.post_token_balances {
+        // Only look at balances owned by the signer
+        if post_bal.owner != signer_b58 {
+            continue;
+        }
+
+        let mint = &post_bal.mint;
+        let post_amount = post_bal
+            .ui_token_amount
+            .as_ref()
+            .and_then(|a| a.ui_amount_string.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        // Find matching pre_token_balance
+        let pre_amount = meta
+            .pre_token_balances
+            .iter()
+            .find(|pre| pre.account_index == post_bal.account_index && pre.mint == *mint)
+            .and_then(|pre| {
+                pre.ui_token_amount
+                    .as_ref()
+                    .and_then(|a| a.ui_amount_string.parse::<f64>().ok())
+            })
+            .unwrap_or(0.0);
+
+        let delta = post_amount - pre_amount;
+
+        if *mint == WSOL_MINT {
+            sol_delta = delta;
+            found_sol = true;
+        } else if delta.abs() > 0.0 {
+            // This is the token leg (non-WSOL)
+            token_delta = delta;
+            token_mint = mint.clone();
+            found_token = true;
+        }
+    }
+
+    // If we didn't find both legs from owned accounts, try checking
+    // SOL balance change from lamport pre/post balances
+    if !found_sol {
+        // Fall back to native SOL balance diff (pre_balances vs post_balances)
+        if !meta.pre_balances.is_empty() && !meta.post_balances.is_empty() {
+            // Signer is always index 0
+            let pre_sol = meta.pre_balances.first().copied().unwrap_or(0) as f64 / 1e9;
+            let post_sol = meta.post_balances.first().copied().unwrap_or(0) as f64 / 1e9;
+            sol_delta = post_sol - pre_sol;
+            found_sol = true;
+        }
+    }
+
+    if !found_sol || !found_token || token_mint.is_empty() {
+        // Can't determine both legs → skip
+        trace!(
+            "Raydium V4: could not determine both legs (sol={}, token={})",
+            found_sol,
+            found_token
+        );
+        return None;
+    }
+
+    // Determine direction:
+    //   SOL decreased + token increased → BUY (spent SOL to get tokens)
+    //   SOL increased + token decreased → SELL (sold tokens for SOL)
+    let is_buy = sol_delta < 0.0 && token_delta > 0.0;
+    let is_sell = sol_delta > 0.0 && token_delta < 0.0;
+
+    if !is_buy && !is_sell {
+        // Ambiguous or zero-delta swap (possibly a failed/dust transaction)
+        trace!(
+            "Raydium V4: ambiguous direction (sol_delta={:.6}, token_delta={:.6})",
+            sol_delta,
+            token_delta
+        );
+        return None;
+    }
+
+    let sol_amount = sol_delta.abs();
+    let token_amount = token_delta.abs();
+
+    // Sanity check: reject dust trades and unrealistic amounts
+    if sol_amount < 0.0001 || sol_amount > 50_000.0 {
+        return None;
+    }
+
+    // Compute price as lamports-per-token (scaled ×1e9)
+    let price = if token_amount > 0.0 {
+        ((sol_amount / token_amount) * 1e9) as u64
+    } else {
+        0
+    };
+
+    let timestamp = current_unix_timestamp();
+
+    trace!(
+        "RaydiumV4 {} {} — {:.6} SOL | {:.2} tokens",
+        if is_buy { "BUY" } else { "SELL" },
+        &token_mint[..8.min(token_mint.len())],
+        sol_amount,
+        token_amount
+    );
+
+    Some(ParsedTrade {
+        wallet,
+        token_mint,
+        is_buy,
+        sol_amount,
+        token_amount,
+        price,
+        slot: 0,
+        timestamp,
+        dex_type: DexType::RaydiumAmmV4,
+        signature: String::new(),
+        tx_index: 0,
+    })
+}
+
+/// Check if a specific program ID is involved in this transaction.
+fn is_program_involved(txn: &SubscribeUpdateTransaction, program_id: &str) -> bool {
+    let tx_inner = match txn.transaction.as_ref() {
+        Some(t) => t,
+        None => return false,
+    };
+    let message = match tx_inner.transaction.as_ref().and_then(|t| t.message.as_ref()) {
+        Some(m) => m,
+        None => return false,
+    };
+
+    let program_bytes = match bs58::decode(program_id).into_vec() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    message.account_keys.iter().any(|key| *key == program_bytes)
 }

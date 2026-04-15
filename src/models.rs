@@ -15,6 +15,7 @@ pub enum DexType {
     PumpFun,
     PumpSwap,
     RaydiumLaunchpad,
+    RaydiumAmmV4,
     Unknown,
 }
 
@@ -24,6 +25,7 @@ impl fmt::Display for DexType {
             DexType::PumpFun => write!(f, "PumpFun"),
             DexType::PumpSwap => write!(f, "PumpSwap"),
             DexType::RaydiumLaunchpad => write!(f, "RaydiumLaunchpad"),
+            DexType::RaydiumAmmV4 => write!(f, "RaydiumAmmV4"),
             DexType::Unknown => write!(f, "Unknown"),
         }
     }

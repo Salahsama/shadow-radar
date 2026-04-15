@@ -42,6 +42,12 @@ base64 = "0.13"
 # Concurrency
 dashmap = "5.5.3"
 
+# In-memory cache (TTL-evicting, bounded, lock-free reads)
+moka = { version = "0.12", features = ["future"] }
+
+# SQLite (WAL mode for concurrent read/write with execution bot)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Logging & Output
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
